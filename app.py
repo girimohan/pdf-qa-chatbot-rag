@@ -93,38 +93,44 @@ def load_documents(files: List[Any]) -> List[Any]:
     docs = []
     for file in files:
         ext = file.name.split(".")[-1].lower()
+        
+        # Reset file pointer to beginning
+        file.seek(0)
+        
         with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp_file:
             tmp_file.write(file.read())
             tmp_path = tmp_file.name
+        
         try:
             if ext == "pdf":
-                # Use PyPDFLoader for reliable PDF text extraction
-                st.info(f"Processing {file.name}...")
-                try:
-                    loader = PyPDFLoader(tmp_path)
-                    pdf_docs = loader.load()
-                    if pdf_docs and any(len(doc.page_content.strip()) > 0 for doc in pdf_docs):
-                        st.success(f"✅ Successfully extracted text from {file.name}")
-                        docs.extend(pdf_docs)
-                    else:
-                        st.warning(f"⚠️ No readable text found in {file.name}. Please ensure PDF contains text (not just images).")
-                except Exception as e:
-                    st.error(f"❌ Error processing {file.name}: {str(e)}")
-                    logger.error(f"Error processing PDF {file.name}: {str(e)}")
+                st.info(f"📄 Processing {file.name}...")
+                loader = PyPDFLoader(tmp_path)
+                pdf_docs = loader.load()
+                
+                if pdf_docs and any(len(doc.page_content.strip()) > 0 for doc in pdf_docs):
+                    st.success(f"✅ Successfully loaded {file.name} ({len(pdf_docs)} pages)")
+                    docs.extend(pdf_docs)
+                else:
+                    st.warning(f"⚠️ No readable text found in {file.name}")
+                    
             elif ext == "txt":
                 loader = TextLoader(tmp_path)
-            elif ext in ["docx", "doc"]:
-                loader = UnstructuredWordDocumentLoader(tmp_path)
+                doc_objs = loader.load()
+                docs.extend(doc_objs)
+                st.success(f"✅ Successfully loaded {file.name}")
+                
             else:
-                st.error(f"Unsupported file type: {ext}")
+                st.error(f"Unsupported file type: {ext}. Only PDF and TXT files are supported.")
                 continue
-            doc_objs = loader.load()
-            docs.extend(doc_objs)
+                
         except Exception as e:
-            st.error(f"Error loading {file.name}: {e}")
-            logger.error(f"Error loading {file.name}: {e}")
+            st.error(f"❌ Error loading {file.name}: {str(e)}")
+            logger.error(f"Error loading {file.name}: {str(e)}")
         finally:
-            os.remove(tmp_path)
+            # Clean up temp file
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+                
     return docs
 
 @st.cache_resource
@@ -496,19 +502,26 @@ st.sidebar.title("� Document Manager")
 # Connection status - simplified
 if QDRANT_CONNECTED:
     if QDRANT_URL:
-        st.sidebar.success("✅ Qdrant Cloud")
+        st.sidebar.success("✅ Qdrant Cloud Connected")
+        # Add a simple test button
+        if st.sidebar.button("🔧 Test Connection"):
+            try:
+                collections = qdrant_client.get_collections()
+                st.sidebar.info(f"📊 Found {len(collections.collections)} collections")
+            except Exception as e:
+                st.sidebar.error(f"❌ Connection test failed: {str(e)}")
     else:
         st.sidebar.success("✅ Local Qdrant")
 else:
-    st.sidebar.warning("⚠️ Memory Mode")
+    st.sidebar.warning("⚠️ Memory Mode - Add QDRANT_URL & QDRANT_API_KEY to secrets")
 
 st.sidebar.markdown("---")
 
 uploaded_files = st.sidebar.file_uploader(
-    "📁 Choose Files",
-    type=["pdf", "txt", "docx", "doc"],
+    "📁 Upload Documents",
+    type=["pdf", "txt"],
     accept_multiple_files=True,
-    help="Upload PDF, TXT, DOCX files"
+    help="Upload PDF or TXT files to chat with them"
 )
 
 # Show selected files
@@ -525,40 +538,60 @@ if st.sidebar.button("🚀 Process Documents", type="primary", disabled=not uplo
         
         try:
             # Load documents with progress
-            status_text.text("Loading documents...")
+            status_text.text("📄 Loading documents...")
             progress_bar.progress(0.2)
-            docs = load_documents(uploaded_files)
             
-            if not docs:
-                st.sidebar.error("❌ No valid documents loaded.")
-            else:
-                # Process documents
-                status_text.text("Processing documents...")
-                progress_bar.progress(0.5)
-                st.session_state.docs = docs
-                
-                chunks, embeddings = chunk_and_embed(docs)
-                progress_bar.progress(0.7)
-                
-                if chunks and embeddings:
-                    # Index to database
-                    status_text.text("Creating vector database...")
-                    st.session_state.db = index_to_qdrant(chunks, embeddings)
-                    st.session_state.retriever = st.session_state.db.as_retriever()
-                    st.session_state.indexed = True
-                    
-                    progress_bar.progress(1.0)
-                    status_text.text("✅ Complete!")
-                    
-                    # Success message
-                    st.sidebar.success(f"🎉 Processed {len(uploaded_files)} files!")
-                    st.sidebar.info(f"📊 Created {len(chunks)} searchable chunks")
-                    st.balloons()
-                    
+            # Check file types first
+            valid_files = []
+            for file in uploaded_files:
+                if file.name.split(".")[-1].lower() in ["pdf", "txt"]:
+                    valid_files.append(file)
                 else:
-                    st.sidebar.error("❌ Processing failed")
+                    st.sidebar.warning(f"⚠️ Skipping {file.name} (unsupported type)")
+            
+            if not valid_files:
+                st.sidebar.error("❌ No valid files (only PDF/TXT supported)")
+                progress_bar.empty()
+                status_text.empty()
+            else:
+                docs = load_documents(valid_files)
+                
+                if not docs:
+                    st.sidebar.error("❌ No readable content found in files")
+                    progress_bar.empty()
+                    status_text.empty()
+                else:
+                    # Process documents
+                    status_text.text("🔄 Processing documents...")
+                    progress_bar.progress(0.5)
+                    st.session_state.docs = docs
+                    
+                    chunks, embeddings = chunk_and_embed(docs)
+                    progress_bar.progress(0.7)
+                    
+                    if chunks and embeddings:
+                        # Index to database
+                        status_text.text("🗄️ Creating vector database...")
+                        st.session_state.db = index_to_qdrant(chunks, embeddings)
+                        if st.session_state.db:
+                            st.session_state.retriever = st.session_state.db.as_retriever()
+                            st.session_state.indexed = True
+                            
+                            progress_bar.progress(1.0)
+                            status_text.text("✅ Complete!")
+                            
+                            # Success message
+                            st.sidebar.success(f"🎉 Ready! Processed {len(valid_files)} files")
+                            st.sidebar.info(f"📊 Created {len(chunks)} searchable chunks")
+                            st.balloons()
+                        else:
+                            st.sidebar.error("❌ Failed to create vector database")
+                    else:
+                        st.sidebar.error("❌ Failed to process documents")
+                        
         except Exception as e:
             st.sidebar.error(f"❌ Error: {str(e)}")
+            st.sidebar.info("💡 Try uploading simpler PDF files or check the logs")
         finally:
             progress_bar.empty()
             status_text.empty()
