@@ -21,10 +21,6 @@ An intelligent document question-answering system using **Retrieval-Augmented Ge
 - **☁️ Cloud Deployment**: HuggingFace FLAN-T5
 - **📄 Document Processing**: Sentence Transformers (all-MiniLM-L6-v2)
 
-## 🚀 Live Demo
-
-Deploy instantly on HuggingFace Spaces - automatically syncs with this GitHub repo!
-
 ## ⚡ Quick Start
 
 1. **Clone & Install**:
@@ -45,11 +41,6 @@ Deploy instantly on HuggingFace Spaces - automatically syncs with this GitHub re
    ```bash
    streamlit run app.py
    ```
-
-## 🌐 Deployment
-
-- **HuggingFace Spaces**: Connect this repo for auto-deployment
-- **Streamlit Cloud**: Link GitHub repo and add environment secrets
 
 ---
 
