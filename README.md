@@ -1,6 +1,6 @@
 ---
 title: PDF Q&A Chatbot with RAG
-emoji: 
+emoji: ""
 colorFrom: blue
 colorTo: green
 sdk: docker
