@@ -3,17 +3,13 @@ import tempfile
 import logging
 from typing import List, Dict, Any
 import streamlit as st
-from langchain_community.document_loaders import PyPDFLoader, UnstructuredPDFLoader, TextLoader, UnstructuredWordDocumentLoader
+from langchain_community.document_loaders import PyPDFLoader, TextLoader, UnstructuredWordDocumentLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_qdrant import Qdrant  # Updated import
+from langchain_qdrant import Qdrant
 from langchain.chains import ConversationalRetrievalChain
-from langchain_community.llms import OpenAI
-from langchain_huggingface import HuggingFaceEmbeddings  # Updated import
+from langchain_huggingface import HuggingFaceEmbeddings
 from qdrant_client import QdrantClient
 from dotenv import load_dotenv
-import pandas as pd
-import numpy as np
-import pytesseract
 
 # Load environment variables
 load_dotenv()
@@ -102,40 +98,19 @@ def load_documents(files: List[Any]) -> List[Any]:
             tmp_path = tmp_file.name
         try:
             if ext == "pdf":
-                # Try different PDF loading strategies
+                # Use PyPDFLoader for reliable PDF text extraction
                 st.info(f"Processing {file.name}...")
-                
-                # 1. Try PyPDFLoader first (fastest)
                 try:
                     loader = PyPDFLoader(tmp_path)
                     pdf_docs = loader.load()
                     if pdf_docs and any(len(doc.page_content.strip()) > 0 for doc in pdf_docs):
                         st.success(f"✅ Successfully extracted text from {file.name}")
                         docs.extend(pdf_docs)
-                        continue
                     else:
-                        st.warning(f"⚠️ No text content found in {file.name}, trying OCR...")
+                        st.warning(f"⚠️ No readable text found in {file.name}. Please ensure PDF contains text (not just images).")
                 except Exception as e:
-                    st.warning(f"⚠️ Standard extraction failed for {file.name}: {str(e)}")
-                
-                # 2. Try UnstructuredPDFLoader with OCR
-                try:
-                    st.info(f"🔍 Attempting OCR extraction for {file.name}...")
-                    loader = UnstructuredPDFLoader(
-                        tmp_path,
-                        mode="elements",
-                        strategy="ocr_only",  # Force OCR for scanned documents
-                        languages=["eng"],
-                        ocr_language="eng"
-                    )
-                    pdf_docs = loader.load()
-                    if pdf_docs and any(len(doc.page_content.strip()) > 0 for doc in pdf_docs):
-                        st.success(f"✅ Successfully extracted text from {file.name} using OCR")
-                        docs.extend(pdf_docs)
-                    else:
-                        st.error(f"❌ Could not extract any text from {file.name}. Please verify the PDF contains readable content.")
-                except Exception as e:
-                    st.error(f"❌ OCR extraction failed for {file.name}: {str(e)}")
+                    st.error(f"❌ Error processing {file.name}: {str(e)}")
+                    logger.error(f"Error processing PDF {file.name}: {str(e)}")
             elif ext == "txt":
                 loader = TextLoader(tmp_path)
             elif ext in ["docx", "doc"]:
@@ -151,6 +126,11 @@ def load_documents(files: List[Any]) -> List[Any]:
         finally:
             os.remove(tmp_path)
     return docs
+
+@st.cache_resource
+def get_embeddings():
+    """Get embeddings model with caching to avoid reloading."""
+    return HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
 
 def chunk_and_embed(docs: List[Any]) -> List[Dict]:
     """Chunk documents and generate embeddings."""
@@ -175,7 +155,7 @@ def chunk_and_embed(docs: List[Any]) -> List[Dict]:
         return [], None
         
     st.success(f"✅ Generated {len(chunks)} text chunks for optimal retrieval")
-    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+    embeddings = get_embeddings()  # Use cached embeddings
     return chunks, embeddings
 
 def index_to_qdrant(chunks: List[Any], embeddings: Any):
@@ -236,8 +216,10 @@ def detect_content_type(docs):
     # Add more content type detection as needed
     return "general"
 
+@st.cache_resource
 def get_llm():
-    """Get the LLM based on environment: Ollama (local) or HuggingFace (production)."""
+    """Get the LLM based on environment: Ollama (local) or HuggingFace (production).
+    Cached to avoid reloading on every interaction."""
     try:
         # Detect environment - Local development vs Cloud deployment
         is_local_dev = os.getenv("ENVIRONMENT") == "local" or os.path.exists("C:/Users")  # Windows dev
@@ -263,24 +245,56 @@ def get_llm():
                 try:
                     from langchain_community.llms import HuggingFaceEndpoint
                     
-                    # Use Google's FLAN-T5 - excellent for Q&A tasks
-                    llm = HuggingFaceEndpoint(
-                        repo_id="google/flan-t5-base",  # Best free model for Q&A
-                        huggingfacehub_api_token=HUGGINGFACE_API_KEY,
-                        temperature=0.3,  # Lower for more focused answers
-                        max_length=256,   # Optimal for Q&A responses
-                        top_k=10,
-                        top_p=0.95
-                    )
+                    # Use a smaller, faster model first for quicker startup
+                    model_options = [
+                        "google/flan-t5-small",    # Fastest startup
+                        "google/flan-t5-base",     # Good balance
+                        "microsoft/DialoGPT-small" # Alternative fast option
+                    ]
                     
-                    # Test with a simple query
-                    response = llm.invoke("What is AI?")
-                    if response:
-                        st.sidebar.success("✅ Google FLAN-T5 Connected")
-                        st.sidebar.caption("� Free tier • Cloud optimized")
-                        return llm
+                    for model_name in model_options:
+                        try:
+                            st.sidebar.info(f"🚀 Loading {model_name.split('/')[-1]}...")
+                            llm = HuggingFaceEndpoint(
+                                repo_id=model_name,
+                                huggingfacehub_api_token=HUGGINGFACE_API_KEY,
+                                temperature=0.3,
+                                max_length=200,  # Reduced for faster response
+                                top_k=5,         # Reduced for speed
+                                top_p=0.9
+                            )
+                            
+                            # Skip test call for faster startup, just return if model loads
+                            st.sidebar.success(f"✅ {model_name.split('/')[-1]} Ready")
+                            st.sidebar.caption("🚀 Fast startup • Cloud optimized")
+                            return llm
+                        except Exception as model_error:
+                            st.sidebar.warning(f"⚠️ {model_name} failed, trying next...")
+                            continue
+                            
                 except Exception as hf_error:
                     st.sidebar.error(f"❌ HuggingFace error: {str(hf_error)}")
+            else:
+                # Try free HuggingFace Inference API without auth (limited requests)
+                try:
+                    st.sidebar.info("🔄 Trying free inference API...")
+                    from langchain_community.llms import HuggingFaceEndpoint
+                    
+                    # Use small model for free tier
+                    llm = HuggingFaceEndpoint(
+                        repo_id="google/flan-t5-small",
+                        temperature=0.3,
+                        max_length=150
+                    )
+                    
+                    response = llm.invoke("Hi")
+                    if response:
+                        st.sidebar.success("✅ Using Free Inference API")
+                        st.sidebar.caption("⚡ Limited requests • Add API key for unlimited")
+                        return llm
+                except Exception as free_error:
+                    st.sidebar.warning(f"⚠️ Free API failed: {str(free_error)}")
+                    st.sidebar.info("💡 Add HUGGINGFACE_API_KEY for reliable access")
         
         # LOCAL: Try Ollama for local development
         if is_local_dev and not is_cloud_deployment:

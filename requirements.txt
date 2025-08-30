@@ -7,9 +7,6 @@ qdrant-client
 sentence-transformers
 pypdf
 python-dotenv
-pandas
-numpy
 transformers
 huggingface_hub
-
 torch
