@@ -399,51 +399,50 @@ def get_llm():
         return None
 
 def query_rag(query: str, retriever: Any, chat_history: List[Dict]) -> str:
-    """Query the RAG pipeline."""
+    """Query the RAG pipeline or general chat."""
     llm = get_llm()
     if llm is None:
         return "LLM not available. Please check the setup instructions.", ""
         
     try:
-        # Convert chat history from dict format to tuple format expected by ConversationalRetrievalChain
-        formatted_history = []
-        for i in range(0, len(chat_history) - 1, 2):  # Process pairs of user/assistant messages
-            if i + 1 < len(chat_history):
-                user_msg = chat_history[i]
-                assistant_msg = chat_history[i + 1]
-                if user_msg.get('role') == 'user' and assistant_msg.get('role') == 'assistant':
-                    formatted_history.append((user_msg['content'], assistant_msg['content']))
-        
-        chain = ConversationalRetrievalChain.from_llm(
-            llm,
-            retriever,
-            return_source_documents=True,
-            chain_type="stuff"
-        )
-        result = chain.invoke({"question": query, "chat_history": formatted_history})
-        answer = result["answer"]
-        sources = result.get("source_documents", [])
+        # If retriever is available, use RAG
+        if retriever:
+            # Convert chat history from dict format to tuple format expected by ConversationalRetrievalChain
+            formatted_history = []
+            for i in range(0, len(chat_history) - 1, 2):  # Process pairs of user/assistant messages
+                if i + 1 < len(chat_history):
+                    user_msg = chat_history[i]
+                    assistant_msg = chat_history[i + 1]
+                    if user_msg.get('role') == 'user' and assistant_msg.get('role') == 'assistant':
+                        formatted_history.append((user_msg['content'], assistant_msg['content']))
+            
+            chain = ConversationalRetrievalChain.from_llm(
+                llm,
+                retriever,
+                return_source_documents=True,
+                chain_type="stuff"
+            )
+            result = chain.invoke({"question": query, "chat_history": formatted_history})
+            answer = result["answer"]
+            sources = result.get("source_documents", [])
+            
+            citations = []
+            for src in sources:
+                meta = src.metadata
+                page = meta.get("page", "?")
+                fname = meta.get("source", "?")
+                citations.append(f"{fname} (page {page})")
+            citation_str = ", ".join(citations)
+            return answer, citation_str
+        else:
+            # General chat mode without documents
+            response = llm.invoke(query)
+            return response, ""
+            
     except Exception as e:
         st.error(f"Error during query: {str(e)}")
         logger.error(f"Error during query: {str(e)}")
         return "Error processing your question. Please try again.", ""
-    
-    citations = []
-    for src in sources:
-        meta = src.metadata
-        page = meta.get("page", "?")
-        fname = meta.get("source", "?")
-        citations.append(f"{fname} (page {page})")
-    citation_str = ", ".join(citations)
-    return answer, citation_str
-    citations = []
-    for src in sources:
-        meta = src.metadata
-        page = meta.get("page", "?")
-        fname = meta.get("source", "?")
-        citations.append(f"{fname} (page {page})")
-    citation_str = ", ".join(citations)
-    return answer, citation_str
 
 def clear_qdrant():
     """Clear the Qdrant collection."""
@@ -488,322 +487,243 @@ st.set_page_config(
 )
 
 # Main title with environment indicator
-col1, col2 = st.columns([3, 1])
-with col1:
-    st.title("📚 PDF Q&A Chatbot with RAG")
-with col2:
-    if IS_HF_SPACES:
-        st.success("🤗 HF Spaces")
-    else:
-        st.info("💻 Local/Cloud")
+st.title("� PDF Q&A Chat")
+st.caption("Upload documents and chat with them using AI • Powered by RAG & HuggingFace")
 
-st.sidebar.title("📚 Document Manager")
+# Sidebar - Simplified
+st.sidebar.title("� Document Manager")
 
-# Display Qdrant connection status
+# Connection status - simplified
 if QDRANT_CONNECTED:
     if QDRANT_URL:
-        st.sidebar.success("✅ Qdrant Cloud Connected")
+        st.sidebar.success("✅ Qdrant Cloud")
     else:
-        st.sidebar.success("✅ Local Qdrant Connected")
+        st.sidebar.success("✅ Local Qdrant")
 else:
-    st.sidebar.warning("⚠️ Using In-Memory Storage")
-    st.sidebar.info("💡 Setup Options:")
-    st.sidebar.markdown("• **Qdrant Cloud**: cloud.qdrant.io (recommended)")
-    st.sidebar.markdown("• **Docker**: `docker-compose up -d`")
-    st.sidebar.markdown("• **Binary**: Download from qdrant.tech")
+    st.sidebar.warning("⚠️ Memory Mode")
 
 st.sidebar.markdown("---")
 
 uploaded_files = st.sidebar.file_uploader(
-    "📁 Upload Documents",
+    "📁 Choose Files",
     type=["pdf", "txt", "docx", "doc"],
     accept_multiple_files=True,
-    help="Supported formats: PDF, TXT, DOCX, DOC"
+    help="Upload PDF, TXT, DOCX files"
 )
 
-if st.sidebar.button("🚀 Index Documents", type="primary"):
-    if not uploaded_files:
-        st.sidebar.error("❌ No files uploaded.")
-    else:
-        with st.spinner("📊 Processing documents..."):
+# Show selected files
+if uploaded_files:
+    st.sidebar.write(f"📄 **{len(uploaded_files)} file(s) selected:**")
+    for file in uploaded_files:
+        st.sidebar.write(f"• {file.name}")
+
+# Process button
+if st.sidebar.button("🚀 Process Documents", type="primary", disabled=not uploaded_files):
+    if uploaded_files:
+        progress_bar = st.sidebar.progress(0)
+        status_text = st.sidebar.empty()
+        
+        try:
+            # Load documents with progress
+            status_text.text("Loading documents...")
+            progress_bar.progress(0.2)
             docs = load_documents(uploaded_files)
+            
             if not docs:
                 st.sidebar.error("❌ No valid documents loaded.")
             else:
+                # Process documents
+                status_text.text("Processing documents...")
+                progress_bar.progress(0.5)
                 st.session_state.docs = docs
+                
                 chunks, embeddings = chunk_and_embed(docs)
-                if chunks and embeddings:  # Only proceed if we have valid chunks and embeddings
-                    try:
-                        st.session_state.db = index_to_qdrant(chunks, embeddings)
-                        st.session_state.retriever = st.session_state.db.as_retriever(
-                            search_kwargs={"filter": None}
-                        )
-                        st.session_state.indexed = True
-                        st.balloons()  # Celebration animation!
-                        
-                        # Show summary
-                        total_chunks = len(chunks)
-                        total_files = len(uploaded_files)
-                        st.success(f"🎉 Indexing Complete!")
-                        st.info(f"📊 **Summary**: {total_files} file(s) → {total_chunks} searchable chunks")
-                        st.info("💬 You can now ask questions about your documents below!")
-                    except Exception as e:
-                        st.error(f"❌ Error during indexing: {str(e)}")
+                progress_bar.progress(0.7)
+                
+                if chunks and embeddings:
+                    # Index to database
+                    status_text.text("Creating vector database...")
+                    st.session_state.db = index_to_qdrant(chunks, embeddings)
+                    st.session_state.retriever = st.session_state.db.as_retriever()
+                    st.session_state.indexed = True
+                    
+                    progress_bar.progress(1.0)
+                    status_text.text("✅ Complete!")
+                    
+                    # Success message
+                    st.sidebar.success(f"🎉 Processed {len(uploaded_files)} files!")
+                    st.sidebar.info(f"📊 Created {len(chunks)} searchable chunks")
+                    st.balloons()
+                    
                 else:
-                    st.error("❌ Could not process documents. Please check if they contain extractable text.")
+                    st.sidebar.error("❌ Processing failed")
+        except Exception as e:
+            st.sidebar.error(f"❌ Error: {str(e)}")
+        finally:
+            progress_bar.empty()
+            status_text.empty()
 
-if st.sidebar.button("🗑️ Clear Database"):
+if st.sidebar.button("🗑️ Clear All", disabled=not st.session_state.indexed):
     clear_qdrant()
+    st.sidebar.success("✅ Cleared!")
+    st.rerun()
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("### 📊 App Status")
+
+# Status - simplified
 if st.session_state.indexed:
-    st.sidebar.success(f"✅ {len(st.session_state.docs)} documents indexed")
-    st.sidebar.info(f"💬 {len(st.session_state.chat_history)} chat messages")
+    st.sidebar.success(f"✅ **{len(st.session_state.docs)}** docs indexed")
+    st.sidebar.info(f"💬 **{len(st.session_state.chat_history)}** messages")
 else:
-    st.sidebar.info("📤 Ready to upload documents")
+    st.sidebar.info("📤 Ready for documents")
 
-# Add model information
+# Model info - minimal
 st.sidebar.markdown("---")
-st.sidebar.markdown("### 🤖 AI Models")
-st.sidebar.markdown("""
-**💬 Chat Model**: Google FLAN-T5 (Free)
-**🔍 Embeddings**: all-MiniLM-L6-v2
-**💾 Vector DB**: Qdrant Cloud
-**⚡ Platform**: Streamlit Community Cloud
+st.sidebar.markdown("**🤖 AI Model**")
+st.sidebar.caption("Google FLAN-T5 (Free)")
+st.sidebar.caption("Qdrant Vector DB")
 
-*All models are completely FREE!*
-""")
+# Main Content Area - Always available chat
+st.markdown("### 💬 AI Assistant")
 
-# Add helpful tips
-st.sidebar.markdown("---")
-st.sidebar.markdown("### 💡 Tips")
-st.sidebar.markdown("""
-• **Ask specific questions** for better answers
-• **Use natural language** - no special syntax needed
-• **Try different phrasings** if results aren't perfect
-• **Check sources** to verify information
-""")
-
-# Add footer
-st.sidebar.markdown("---")
-st.sidebar.markdown("### 🔗 Links")
-st.sidebar.markdown("""
-[📖 Documentation](https://github.com/your-repo)
-[🐛 Report Bug](https://github.com/your-repo/issues)
-[⭐ Star Project](https://github.com/your-repo)
-""")
-
-st.sidebar.markdown("---")
-st.sidebar.caption("Made with ❤️ using Streamlit & AI")
-
-st.title("🤖 AI Document Assistant")
-st.markdown("*Powered by RAG (Retrieval-Augmented Generation) • Qdrant Cloud • Free AI Models*")
-st.markdown("---")
-
+# Show current mode
 if st.session_state.indexed:
-    # Create two columns for better layout
-    col1, col2 = st.columns([3, 1])
-    
-    with col1:
-        st.markdown("### 💬 Chat with your documents")
-    
-    with col2:
-        if st.button("🔄 New Chat", type="secondary"):
-            st.session_state.chat_history = []
-            st.rerun()
-    
-    # Custom CSS for better chat appearance
-    st.markdown("""
-    <style>
-    .chat-message {
-        padding: 1rem;
-        border-radius: 0.5rem;
-        margin-bottom: 1rem;
-        border-left: 4px solid #ff6b6b;
-    }
-    .user-message {
-        background-color: #f0f2f6;
-        border-left-color: #ff6b6b;
-    }
-    .assistant-message {
-        background-color: #e8f4f8;
-        border-left-color: #1f77b4;
-    }
-    .source-citation {
-        font-size: 0.85em;
-        color: #666;
-        font-style: italic;
-        margin-top: 0.5rem;
-        padding: 0.5rem;
-        background-color: #f8f9fa;
-        border-radius: 0.25rem;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-    
-    # Display chat history with improved formatting
-    chat_container = st.container()
-    with chat_container:
-        for i, msg in enumerate(st.session_state.chat_history):
-            if msg["role"] == "user":
-                with st.chat_message("user", avatar="👤"):
-                    st.markdown(f"**You asked:** {msg['content']}")
+    st.info(f"📚 **Document Mode**: Chatting with {len(st.session_state.docs)} uploaded documents")
+else:
+    st.info("🤖 **General Mode**: Ask me anything! Upload documents for document-specific Q&A")
+
+# New chat button - top right
+col1, col2 = st.columns([4, 1])
+with col2:
+    if st.button("🔄 New Chat", type="secondary"):
+        st.session_state.chat_history = []
+        st.rerun()
+
+# Display chat history - always show
+for msg in st.session_state.chat_history:
+    if msg["role"] == "user":
+        with st.chat_message("user"):
+            st.write(msg["content"])
+    else:
+        with st.chat_message("assistant"):
+            content = msg["content"]
+            if "📎 **Sources:**" in content:
+                answer_part, sources_part = content.split("📎 **Sources:**", 1)
+                st.write(answer_part)
+                st.caption(f"📎 Sources: {sources_part.strip()}")
             else:
-                with st.chat_message("assistant", avatar="🤖"):
-                    # Parse assistant message to separate answer and sources
-                    content = msg["content"]
-                    if "📎 **Sources:**" in content:
-                        answer_part, sources_part = content.split("📎 **Sources:**", 1)
-                        st.markdown(answer_part.replace("**Assistant:** ", ""))
-                        st.markdown(f'<div class="source-citation">📎 <strong>Sources:</strong> {sources_part.strip()}</div>', 
-                                  unsafe_allow_html=True)
-                    else:
-                        st.markdown(content.replace("**Assistant:** ", ""))
+                st.write(content)
     
-    # Improved chat input with suggestions
-    st.markdown("---")
+# Quick questions - adaptive based on mode
+if not st.session_state.chat_history:
+    if st.session_state.indexed:
+        st.markdown("**Document questions:**")
+        quick_questions = [
+            "Summarize main points",
+            "Key requirements?", 
+            "Important dates?",
+            "Main topics?"
+        ]
+    else:
+        st.markdown("**General questions:**")
+        quick_questions = [
+            "What is artificial intelligence?",
+            "Explain machine learning", 
+            "How does RAG work?",
+            "What is Python?"
+        ]
     
-    # Quick question buttons
-    st.markdown("**💡 Quick questions:**")
-    quick_questions = [
-        "📋 What are the main topics?",
-        "📊 Can you summarize this?", 
-        "🔍 What are the key requirements?",
-        "❓ What should I know about this?"
-    ]
-    
-    cols = st.columns(len(quick_questions))
-    for i, question in enumerate(quick_questions):
-        with cols[i]:
+    cols = st.columns(4)
+    for i, (col, question) in enumerate(zip(cols, quick_questions)):
+        with col:
             if st.button(question, key=f"quick_{i}", use_container_width=True):
-                # Remove emoji and process the question
-                clean_question = question.split(" ", 1)[1]
-                user_query = clean_question
-                # Process the question immediately
-                st.session_state.chat_history.append({"role": "user", "content": user_query})
-                with st.spinner("🤔 Analyzing documents..."):
-                    answer, citations = query_rag(
-                        user_query,
-                        st.session_state.retriever,
-                        st.session_state.chat_history
-                    )
-                    response_text = f"{answer}"
-                    if citations:
-                        response_text += f"\n\n📎 **Sources:** {citations}"
+                # Process question
+                st.session_state.chat_history.append({"role": "user", "content": question})
+                with st.spinner("Thinking..."):
+                    if st.session_state.indexed:
+                        # Document-specific Q&A using RAG
+                        answer, citations = query_rag(
+                            question,
+                            st.session_state.retriever,
+                            st.session_state.chat_history
+                        )
+                        response_text = answer
+                        if citations:
+                            response_text += f"\n\n📎 **Sources:** {citations}"
+                    else:
+                        # General Q&A using LLM only
+                        llm = get_llm()
+                        if llm:
+                            try:
+                                answer = llm.invoke(question)
+                                response_text = answer
+                            except Exception as e:
+                                response_text = f"Sorry, I encountered an error: {str(e)}"
+                        else:
+                            response_text = "AI model not available. Please check your setup."
+                    
                     st.session_state.chat_history.append({"role": "assistant", "content": response_text})
                 st.rerun()
+
+# Chat input - adaptive placeholder
+if st.session_state.indexed:
+    placeholder_text = "Ask about your documents..."
+else:
+    placeholder_text = "Ask me anything..."
+
+user_input = st.chat_input(placeholder_text)
+
+if user_input:
+    # Add user message
+    st.session_state.chat_history.append({"role": "user", "content": user_input})
     
-    # Custom chat input
-    user_query = st.chat_input("💭 Ask anything about your documents... (e.g., 'What are the main requirements?')")
-    
-    if user_query:
-        # Add user message to history
-        st.session_state.chat_history.append({"role": "user", "content": user_query})
-        
-        # Show thinking animation
-        with st.spinner("🤔 Analyzing documents and generating response..."):
+    # Get AI response
+    with st.spinner("Generating response..."):
+        if st.session_state.indexed:
+            # Document-specific Q&A using RAG
             answer, citations = query_rag(
-                user_query,
+                user_input,
                 st.session_state.retriever,
                 st.session_state.chat_history
             )
             
-            # Format response with sources
-            response_text = f"{answer}"
+            response_text = answer
             if citations:
                 response_text += f"\n\n📎 **Sources:** {citations}"
-            
-            st.session_state.chat_history.append({"role": "assistant", "content": response_text})
+        else:
+            # General Q&A using LLM only
+            llm = get_llm()
+            if llm:
+                try:
+                    answer = llm.invoke(user_input)
+                    response_text = answer
+                except Exception as e:
+                    response_text = f"Sorry, I encountered an error: {str(e)}"
+            else:
+                response_text = "AI model not available. Please check your setup."
         
-        # Rerun to show the new messages
+        st.session_state.chat_history.append({"role": "assistant", "content": response_text})
         st.rerun()
-        
-else:
-    # Enhanced welcome screen
-    st.markdown("### 🚀 Get Started")
-    
-    # Create attractive info boxes
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.markdown("""
-        <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-                    padding: 1.5rem; border-radius: 10px; color: white; text-align: center;">
-            <h3>📁 Upload</h3>
-            <p>PDF, DOCX, TXT files</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col2:
-        st.markdown("""
-        <div style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); 
-                    padding: 1.5rem; border-radius: 10px; color: white; text-align: center;">
-            <h3>🔄 Process</h3>
-            <p>AI extracts & indexes content</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col3:
-        st.markdown("""
-        <div style="background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); 
-                    padding: 1.5rem; border-radius: 10px; color: white; text-align: center;">
-            <h3>💬 Chat</h3>
-            <p>Ask questions & get answers</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    st.markdown("---")
-    
-    # Feature highlights
-    st.markdown("### ✨ Features")
-    feature_cols = st.columns(2)
-    
-    with feature_cols[0]:
-        st.markdown("""
-        **🎯 Smart Q&A**
-        - Natural language questions
-        - Context-aware responses
-        - Source citations included
-        
-        **🔍 Advanced Search**
-        - Semantic similarity matching
-        - Multi-document support
-        - Persistent storage
-        """)
-    
-    with feature_cols[1]:
-        st.markdown("""
-        **� Powered By**
-        - Google FLAN-T5 (Free AI)
-        - Qdrant Vector Database
-        - Advanced RAG Pipeline
-        
-        **💡 Perfect For**
-        - Research documents
-        - Policy manuals
-        - Educational content
-        """)
-    
-    # Instructions with emojis
-    st.markdown("---")
-    st.markdown("### 📋 How to Use")
+
+# Tips section - always visible
+st.markdown("---")
+st.markdown("### 💡 How to Use")
+
+if st.session_state.indexed:
     st.markdown("""
-    1. **� Upload** your documents using the sidebar
-    2. **� Click "Index Documents"** to process them
-    3. **💬 Ask questions** about your content
-    4. **📚 Get intelligent answers** with source references
-    
-    **Example questions:**
-    - *"What are the main points discussed?"*
-    - *"Can you explain the requirements in simple terms?"*
-    - *"What should I focus on first?"*
-    - *"Are there any important deadlines mentioned?"*
+    **📄 Document Mode Active:**
+    • Ask specific questions about your uploaded documents
+    • Questions will search through your document content
+    • Check source citations to verify information
+    """)
+else:
+    st.markdown("""
+    **🤖 General AI Mode:**
+    • Ask me about any topic - technology, science, etc.
+    • Upload documents above to switch to document-specific Q&A
+    • I can explain concepts, provide definitions, and answer questions
     """)
 
-# Sample run command
-# streamlit run app.py
-
-# For containerization, see Dockerfile in project root.
-
-# Inline comments throughout code explain key sections.
+# Footer
+st.markdown("---")
+st.caption("Made with ❤️ using Streamlit, LangChain & HuggingFace")
