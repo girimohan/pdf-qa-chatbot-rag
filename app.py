@@ -285,18 +285,34 @@ def get_llm():
         
         # LOCAL: Try Ollama for local development
         if is_local_dev and not is_cloud_deployment:
-                            temperature=0.7,
-                            max_length=512
-                        )
-                        response = llm.invoke("Hi")
-                        if response:
-                            st.sidebar.success("✅ Using DialoGPT (FREE)")
-                            return llm
-                    except Exception as fallback_error:
-                        st.sidebar.error(f"❌ Fallback model failed: {str(fallback_error)}")
-            else:
-                st.sidebar.warning("🌐 Cloud deployment detected")
-                st.sidebar.info("💡 Add HUGGINGFACE_API_KEY for FREE cloud LLM")
+            try:
+                from langchain_community.llms import Ollama
+                llm = Ollama(model="mistral", temperature=0.7)
+                response = llm.invoke("Hi")
+                if response:
+                    st.sidebar.success("✅ Using Ollama/Mistral (FREE)")
+                    return llm
+            except Exception as ollama_error:
+                st.sidebar.warning(f"⚠️ Ollama not available: {str(ollama_error)}")
+                # Try alternative local model
+                try:
+                    from transformers import pipeline
+                    from langchain_community.llms import HuggingFacePipeline
+                    
+                    pipe = pipeline("text-generation", model="microsoft/DialoGPT-medium", 
+                                  tokenizer="microsoft/DialoGPT-medium",
+                                  max_length=200,
+                                  temperature=0.7)
+                    llm = HuggingFacePipeline(pipeline=pipe)
+                    response = llm.invoke("Hi")
+                    if response:
+                        st.sidebar.success("✅ Using DialoGPT (FREE)")
+                        return llm
+                except Exception as fallback_error:
+                    st.sidebar.error(f"❌ Fallback model failed: {str(fallback_error)}")
+        else:
+            st.sidebar.warning("🌐 Cloud deployment detected")
+            st.sidebar.info("💡 Add HUGGINGFACE_API_KEY for FREE cloud LLM")
         
         # Try OpenAI as fallback (if user wants to pay)
         if OPENAI_API_KEY:
