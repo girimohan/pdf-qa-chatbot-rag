@@ -8,7 +8,6 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_qdrant import Qdrant  # Updated import
 from langchain.chains import ConversationalRetrievalChain
 from langchain_community.llms import OpenAI
-from langchain_ollama import OllamaLLM
 from langchain_huggingface import HuggingFaceEmbeddings  # Updated import
 from qdrant_client import QdrantClient
 from dotenv import load_dotenv
@@ -348,13 +347,14 @@ def get_llm():
                 # Test Ollama connection
                 try:
                     # Initialize Ollama with simplified configuration
-                    llm = OllamaLLM(
+                    from langchain_community.llms import Ollama
+                    llm = Ollama(
                         model=selected_model,
                         temperature=0.7,
                         base_url="http://localhost:11434"
                     )
                     # Log the initialization details
-                    logger.info(f"Initialized OllamaLLM with model: {selected_model}")
+                    logger.info(f"Initialized Ollama with model: {selected_model}")
                     # Simple test query with more informative error handling
                     response = llm.invoke("Hi")
                     logger.info(f"Ollama response: {response}")
