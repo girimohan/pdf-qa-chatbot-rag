@@ -10,6 +10,14 @@ from langchain.chains import ConversationalRetrievalChain
 from langchain_huggingface import HuggingFaceEmbeddings
 from qdrant_client import QdrantClient
 from dotenv import load_dotenv
+# Main title with environment indicator
+st.title("📚 PDF Q&A Chat")
+st.caption("Upload documents and chat with them using AI • Powered by RAG & HuggingFace")
+
+# Add version info to force cache refresh
+st.sidebar.markdown("---")
+st.sidebar.caption("🔄 Version 2.1 - Updated: Aug 30, 2025")
+st.sidebar.caption("💫 Cache-busted for fresh deployment")
 
 # Load environment variables
 load_dotenv()
@@ -137,6 +145,15 @@ def load_documents(files: List[Any]) -> List[Any]:
 def get_embeddings():
     """Get embeddings model with caching to avoid reloading."""
     return HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+
+def clear_streamlit_cache():
+    """Clear all Streamlit caches"""
+    try:
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        st.success("✅ Cache cleared!")
+    except Exception as e:
+        st.error(f"Cache clear error: {e}")
 
 def chunk_and_embed(docs: List[Any]) -> List[Dict]:
     """Chunk documents and generate embeddings."""
@@ -599,6 +616,11 @@ if st.sidebar.button("🚀 Process Documents", type="primary", disabled=not uplo
 if st.sidebar.button("🗑️ Clear All", disabled=not st.session_state.indexed):
     clear_qdrant()
     st.sidebar.success("✅ Cleared!")
+    st.rerun()
+
+# Add cache clearing button
+if st.sidebar.button("🔄 Clear Cache"):
+    clear_streamlit_cache()
     st.rerun()
 
 st.sidebar.markdown("---")
