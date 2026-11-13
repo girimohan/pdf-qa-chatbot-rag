@@ -8,3 +8,7 @@ textColor = "#262730"
 headless = true
 port = 7860
 maxUploadSize = 25
+enableCORS = true
+enableXsrfProtection = true
+# Hugging Face embeds Spaces cross-site; file uploads need this XSRF cookie setting.
+xsrfCookieSameSite = "none"

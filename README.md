@@ -27,6 +27,10 @@ The Space does not call Ollama on the developer's computer or depend on a hosted
 FLAN-T5 inference provider. The model weights are public; no Hugging Face
 Inference Providers token is required.
 
+Streamlit's CORS and XSRF protections stay enabled. Its XSRF cookie uses
+`SameSite=None` so file uploads work when the Space is embedded on Hugging Face's
+site. The Space is served over HTTPS, as required for this cookie setting.
+
 ## Hugging Face Space setup
 
 The Space uses process-local, in-memory Qdrant by default, even if old Cloud
