@@ -6,7 +6,6 @@ from uuid import uuid4
 import streamlit as st
 from dotenv import load_dotenv
 from langchain_qdrant import QdrantVectorStore
-from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
 
 from rag import (
@@ -15,6 +14,7 @@ from rag import (
     DocumentChunk,
     answer_question,
     chunk_pages,
+    create_qdrant_client,
     create_session_documents,
     create_session_retriever,
     delete_session_documents,
@@ -41,6 +41,7 @@ LLM_BACKEND = os.getenv(
 ).lower()
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+QDRANT_MODE = os.getenv("QDRANT_MODE", "memory").strip().lower()
 MAX_TOTAL_UPLOAD_BYTES = 25 * 1024 * 1024
 
 st.set_page_config(
@@ -66,14 +67,16 @@ def get_embeddings(model_name: str):
 def get_qdrant_resources(
     collection_name: str,
     embedding_model: str,
+    qdrant_mode: str,
     qdrant_url: str,
     qdrant_api_key: str,
 ):
     embeddings = get_embeddings(embedding_model)
-    if qdrant_url:
-        client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key or None)
-    else:
-        client = QdrantClient(":memory:")
+    client = create_qdrant_client(
+        qdrant_mode,
+        url=qdrant_url or None,
+        api_key=qdrant_api_key or None,
+    )
 
     if not client.collection_exists(collection_name):
         vector_size = len(embeddings.embed_query("dimension check"))
@@ -170,6 +173,7 @@ def run_chat_action(prompt: str, summarize: bool = False) -> None:
             _, vector_store = get_qdrant_resources(
                 COLLECTION_NAME,
                 EMBEDDING_MODEL,
+                QDRANT_MODE,
                 QDRANT_URL or "",
                 QDRANT_API_KEY or "",
             )
@@ -232,14 +236,16 @@ with st.sidebar:
     else:
         st.error("Unsupported LLM_BACKEND configuration.")
 
-    if QDRANT_URL:
+    if QDRANT_MODE == "cloud":
         st.caption("Vector store: configured Qdrant server")
         st.warning(
             "Source text is stored in the configured Qdrant server until the session "
             "is cleared. Avoid sensitive documents."
         )
-    else:
+    elif QDRANT_MODE == "memory":
         st.caption("Vector store: session-isolated in-memory Qdrant")
+    else:
+        st.error("QDRANT_MODE must be either 'memory' or 'cloud'.")
 
     uploaded_files = st.file_uploader(
         "Upload PDF or TXT files",
@@ -286,6 +292,7 @@ with st.sidebar:
                             client, vector_store = get_qdrant_resources(
                                 COLLECTION_NAME,
                                 EMBEDDING_MODEL,
+                                QDRANT_MODE,
                                 QDRANT_URL or "",
                                 QDRANT_API_KEY or "",
                             )
@@ -335,6 +342,7 @@ with st.sidebar:
                 client, _ = get_qdrant_resources(
                     COLLECTION_NAME,
                     EMBEDDING_MODEL,
+                    QDRANT_MODE,
                     QDRANT_URL or "",
                     QDRANT_API_KEY or "",
                 )

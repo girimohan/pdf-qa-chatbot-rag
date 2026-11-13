@@ -131,6 +131,20 @@ def source_text(source: DocumentChunk | Document) -> str:
     return source.page_content
 
 
+def create_qdrant_client(
+    mode: str,
+    url: str | None = None,
+    api_key: str | None = None,
+) -> QdrantClient:
+    if mode == "memory":
+        return QdrantClient(":memory:")
+    if mode == "cloud":
+        if not url:
+            raise ValueError("QDRANT_URL is required when QDRANT_MODE is 'cloud'.")
+        return QdrantClient(url=url, api_key=api_key or None)
+    raise ValueError("QDRANT_MODE must be either 'memory' or 'cloud'.")
+
+
 def create_session_documents(
     chunks: Sequence[DocumentChunk], session_id: str, index_id: str
 ) -> list[Document]:

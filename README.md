@@ -29,14 +29,14 @@ Inference Providers token is required.
 
 ## Hugging Face Space setup
 
-The Space uses process-local, in-memory Qdrant by default, so no database secrets
-are required for a demo. Set `QDRANT_URL` and `QDRANT_API_KEY` as Space secrets to
-use Qdrant Cloud instead.
+The Space uses process-local, in-memory Qdrant by default, even if old Cloud
+secrets are still configured. No database secrets are required for a demo. To use
+Qdrant Cloud, explicitly set `QDRANT_MODE=cloud` and configure `QDRANT_URL` and
+`QDRANT_API_KEY` as Space secrets.
 
 Vectors and source text are filtered by a random Streamlit session ID. Clearing a
 session deletes only that session's points. In-memory data is lost when the Space
-restarts. If Qdrant Cloud is configured, explicitly clear sessions to remove
-persisted data.
+restarts. In Cloud mode, explicitly clear sessions to remove persisted data.
 
 ## Local development
 
@@ -57,7 +57,7 @@ persisted data.
    ```
 
 To run FLAN-T5 locally instead, set `LLM_BACKEND=flan_t5` in `.env`. To use
-Qdrant Cloud locally, set `QDRANT_URL` and `QDRANT_API_KEY`.
+Qdrant Cloud locally, set `QDRANT_MODE=cloud`, `QDRANT_URL`, and `QDRANT_API_KEY`.
 
 ## Supported files and limits
 

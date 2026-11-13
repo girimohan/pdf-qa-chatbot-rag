@@ -13,6 +13,7 @@ from rag import (
     DocumentPage,
     answer_question,
     chunk_pages,
+    create_qdrant_client,
     create_session_documents,
     create_session_retriever,
     delete_session_documents,
@@ -134,6 +135,21 @@ class QdrantIsolationTests(unittest.TestCase):
 
     def tearDown(self):
         self.client.close()
+
+    def test_memory_mode_ignores_stale_cloud_credentials(self):
+        client = create_qdrant_client(
+            "memory",
+            url="https://unreachable.example",
+            api_key="stale-key",
+        )
+        try:
+            self.assertFalse(client.collection_exists("pdf_docs"))
+        finally:
+            client.close()
+
+    def test_cloud_mode_requires_a_url(self):
+        with self.assertRaisesRegex(ValueError, "QDRANT_URL is required"):
+            create_qdrant_client("cloud")
 
     def test_retrieval_is_filtered_to_one_session_and_index(self):
         retriever = create_session_retriever(self.store, "session-a", "index-a")
