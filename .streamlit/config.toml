@@ -6,5 +6,5 @@ textColor = "#262730"
 
 [server]
 headless = true
-port = $PORT
-enableCORS = false
+port = 7860
+maxUploadSize = 25

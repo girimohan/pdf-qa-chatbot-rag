@@ -1,784 +1,369 @@
-import os
-import tempfile
 import logging
-from typing import List, Dict, Any
+import os
+from collections.abc import Sequence
+from uuid import uuid4
+
 import streamlit as st
-from langchain_community.document_loaders import PyPDFLoader, TextLoader, UnstructuredWordDocumentLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_qdrant import Qdrant
-from langchain.chains import ConversationalRetrievalChain
-from langchain_huggingface import HuggingFaceEmbeddings
-from qdrant_client import QdrantClient
 from dotenv import load_dotenv
-# Main title with environment indicator
-st.title("📚 PDF Q&A Chat")
-st.caption("Upload documents and chat with them using AI • Powered by RAG & HuggingFace")
+from langchain_qdrant import QdrantVectorStore
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams
 
-# Add version info to force cache refresh
-st.sidebar.markdown("---")
-st.sidebar.caption("🔄 Version 2.1 - Updated: Aug 30, 2025")
-st.sidebar.caption("💫 Cache-busted for fresh deployment")
-
-# Load environment variables
-load_dotenv()
-
-# Logging setup
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Configurations
-COLLECTION_NAME = "pdf_docs"
-VECTOR_SIZE = 384  # For 'all-MiniLM-L6-v2', change if using a different model
-QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
-QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
-QDRANT_URL = os.getenv("QDRANT_URL")  # For Qdrant Cloud
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")  # For Qdrant Cloud
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-# HuggingFace Spaces optimized configuration
-HUGGINGFACE_API_KEY = (
-    os.getenv("HF_TOKEN") or  # HF Spaces automatically provides this
-    os.getenv("HUGGINGFACE_API_KEY") or  # Fallback for other deployments
-    os.getenv("HUGGINGFACEHUB_API_TOKEN")  # Legacy name
+from rag import (
+    CHUNK_SIZE,
+    MAX_CHUNKS_PER_SESSION,
+    DocumentChunk,
+    answer_question,
+    chunk_pages,
+    create_session_documents,
+    create_session_retriever,
+    delete_session_documents,
+    load_document_pages,
+    source_label,
+    source_text,
+    summarize_document,
 )
 
-# Detect if running on HuggingFace Spaces
-IS_HF_SPACES = "SPACE_ID" in os.environ or "HF_TOKEN" in os.environ
+load_dotenv()
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
+logger = logging.getLogger(__name__)
 
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", "pdf_docs")
+EMBEDDING_MODEL = os.getenv(
+    "EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
+)
+FLAN_MODEL = os.getenv("HF_FLAN_MODEL", "google/flan-t5-base")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral:7b")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+IS_HF_SPACE = bool(os.getenv("SPACE_ID"))
+LLM_BACKEND = os.getenv(
+    "LLM_BACKEND", "flan_t5" if IS_HF_SPACE else "ollama"
+).lower()
+QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+MAX_TOTAL_UPLOAD_BYTES = 25 * 1024 * 1024
 
-# Ollama model configurations
-OLLAMA_MODELS = {
-    "general": "mistral:latest",  # Good balance of performance and speed
-    "code": "mistral:latest",    # Use mistral for code as well
-    "large": "mistral:latest"    # Use mistral for complex reasoning
-}
-DEFAULT_MODEL = "mistral:latest"  # Ensure the default model is mistral
-
-# Qdrant client setup
-try:
-    if QDRANT_URL and QDRANT_API_KEY:
-        # Qdrant Cloud configuration
-        qdrant_client = QdrantClient(
-            url=QDRANT_URL,
-            api_key=QDRANT_API_KEY,
-        )
-        logger.info("Connecting to Qdrant Cloud...")
-    else:
-        # Local Qdrant configuration
-        qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
-        logger.info(f"Connecting to local Qdrant at {QDRANT_HOST}:{QDRANT_PORT}...")
-    
-    # Test connection
-    qdrant_client.get_collections()
-    QDRANT_CONNECTED = True
-    logger.info("✅ Qdrant connection successful!")
-except Exception as e:
-    logger.warning(f"Qdrant server not available: {e}")
-    qdrant_client = QdrantClient(":memory:")  # Fallback to in-memory
-    QDRANT_CONNECTED = False
-
-# Streamlit session state initialization
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-if "indexed" not in st.session_state:
-    st.session_state.indexed = False
-if "docs" not in st.session_state:
-    st.session_state.docs = []
-if "db" not in st.session_state:
-    st.session_state.db = None
-if "retriever" not in st.session_state:
-    st.session_state.retriever = None
-if "chain" not in st.session_state:
-    st.session_state.chain = None
-if "progress" not in st.session_state:
-    st.session_state.progress = 0
-
-# Helper functions
-
-def load_documents(files: List[Any]) -> List[Any]:
-    """Load documents from uploaded files."""
-    docs = []
-    for file in files:
-        ext = file.name.split(".")[-1].lower()
-        
-        # Reset file pointer to beginning
-        file.seek(0)
-        
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp_file:
-            tmp_file.write(file.read())
-            tmp_path = tmp_file.name
-        
-        try:
-            if ext == "pdf":
-                st.info(f"📄 Processing {file.name}...")
-                loader = PyPDFLoader(tmp_path)
-                pdf_docs = loader.load()
-                
-                if pdf_docs and any(len(doc.page_content.strip()) > 0 for doc in pdf_docs):
-                    st.success(f"✅ Successfully loaded {file.name} ({len(pdf_docs)} pages)")
-                    docs.extend(pdf_docs)
-                else:
-                    st.warning(f"⚠️ No readable text found in {file.name}")
-                    
-            elif ext == "txt":
-                loader = TextLoader(tmp_path)
-                doc_objs = loader.load()
-                docs.extend(doc_objs)
-                st.success(f"✅ Successfully loaded {file.name}")
-                
-            else:
-                st.error(f"Unsupported file type: {ext}. Only PDF and TXT files are supported.")
-                continue
-                
-        except Exception as e:
-            st.error(f"❌ Error loading {file.name}: {str(e)}")
-            logger.error(f"Error loading {file.name}: {str(e)}")
-        finally:
-            # Clean up temp file
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-                
-    return docs
-
-@st.cache_resource
-def get_embeddings():
-    """Get embeddings model with caching to avoid reloading."""
-    return HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
-
-def clear_streamlit_cache():
-    """Clear all Streamlit caches"""
-    try:
-        st.cache_data.clear()
-        st.cache_resource.clear()
-        st.success("✅ Cache cleared!")
-    except Exception as e:
-        st.error(f"Cache clear error: {e}")
-
-def chunk_and_embed(docs: List[Any]) -> List[Dict]:
-    """Chunk documents and generate embeddings."""
-    if not docs:
-        st.error("No documents were loaded successfully.")
-        return [], None
-        
-    # Log the content of the first document for debugging
-    if docs:
-        st.info(f"📄 Processing {len(docs)} document pages (Total characters: {sum(len(doc.page_content) for doc in docs):,})")
-    
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        length_function=len,
-        is_separator_regex=False
-    )
-    chunks = splitter.split_documents(docs)
-    
-    if not chunks:
-        st.error("❌ No chunks were generated from the documents.")
-        return [], None
-        
-    st.success(f"✅ Generated {len(chunks)} text chunks for optimal retrieval")
-    embeddings = get_embeddings()  # Use cached embeddings
-    return chunks, embeddings
-
-def index_to_qdrant(chunks: List[Any], embeddings: Any):
-    """Index chunks to Qdrant with persistent storage."""
-    try:
-        # Check if collection exists, if not create it
-        collections = qdrant_client.get_collections()
-        collection_exists = any(col.name == COLLECTION_NAME for col in collections.collections)
-        
-        if not collection_exists:
-            from qdrant_client.models import Distance, VectorParams
-            qdrant_client.create_collection(
-                collection_name=COLLECTION_NAME,
-                vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE)
-            )
-            st.info(f"🆕 Created new collection: {COLLECTION_NAME}")
-        else:
-            st.info(f"📊 Using existing collection: {COLLECTION_NAME}")
-        
-        # Create Qdrant vector store with persistent connection
-        db = Qdrant(
-            client=qdrant_client,
-            collection_name=COLLECTION_NAME,
-            embeddings=embeddings
-        )
-        
-        # Add documents to the collection
-        with st.spinner("🔄 Indexing documents to vector database..."):
-            db.add_documents(chunks)
-        st.success(f"✅ Successfully indexed {len(chunks)} chunks to Qdrant Cloud")
-        
-        return db
-        
-    except Exception as e:
-        st.error(f"Error indexing to Qdrant: {str(e)}")
-        logger.error(f"Error indexing to Qdrant: {str(e)}")
-        # Fallback to in-memory if Qdrant server is not available
-        st.warning("Falling back to in-memory storage")
-        return Qdrant.from_documents(
-            chunks,
-            embeddings,
-            location=":memory:",
-            collection_name=COLLECTION_NAME,
-            prefer_grpc=False
-        )
-
-def detect_content_type(docs):
-    """Detect the type of content in the documents."""
-    # Join all document content
-    all_content = " ".join(doc.page_content for doc in docs).lower()
-    
-    # Check for code-related content
-    code_indicators = ["def ", "class ", "function", "import ", "console.log", 
-                      "public class", "private void", "var ", "let ", "const "]
-    if any(indicator in all_content for indicator in code_indicators):
-        return "code"
-    
-    # Add more content type detection as needed
-    return "general"
-
-@st.cache_resource
-def get_llm():
-    """Get the LLM based on environment: Ollama (local) or HuggingFace (production).
-    Cached to avoid reloading on every interaction."""
-    try:
-        # Detect environment - Local development vs Cloud deployment
-        is_local_dev = os.getenv("ENVIRONMENT") == "local" or os.path.exists("C:/Users")  # Windows dev
-        is_cloud_deployment = (
-            os.getenv("ENVIRONMENT") == "production" or
-            "streamlit" in os.getenv("USER", "").lower() or  # Streamlit Cloud
-            os.getenv("DYNO") or  # Heroku
-            os.getenv("RAILWAY_ENVIRONMENT") or  # Railway
-            os.getenv("RENDER")  # Render
-        )
-        
-        st.sidebar.markdown("### 🤖 AI Model Status")
-        if is_local_dev and not is_cloud_deployment:
-            st.sidebar.info("🏠 **Local Development Mode**")
-            st.sidebar.caption("Using Ollama/Mistral for privacy")
-        else:
-            st.sidebar.info("☁️ **Production Mode**") 
-            st.sidebar.caption("Using HuggingFace (free tier)")
-        
-        # PRODUCTION: Try HuggingFace (FREE) for cloud deployment
-        if is_cloud_deployment or HUGGINGFACE_API_KEY:
-            if HUGGINGFACE_API_KEY:
-                try:
-                    from langchain_community.llms import HuggingFaceEndpoint
-                    
-                    # Use a smaller, faster model first for quicker startup
-                    model_options = [
-                        "google/flan-t5-small",    # Fastest startup
-                        "google/flan-t5-base",     # Good balance
-                        "microsoft/DialoGPT-small" # Alternative fast option
-                    ]
-                    
-                    for model_name in model_options:
-                        try:
-                            st.sidebar.info(f"🚀 Loading {model_name.split('/')[-1]}...")
-                            llm = HuggingFaceEndpoint(
-                                repo_id=model_name,
-                                huggingfacehub_api_token=HUGGINGFACE_API_KEY,
-                                temperature=0.3,
-                                max_length=200,  # Reduced for faster response
-                                top_k=5,         # Reduced for speed
-                                top_p=0.9
-                            )
-                            
-                            # Skip test call for faster startup, just return if model loads
-                            st.sidebar.success(f"✅ {model_name.split('/')[-1]} Ready")
-                            st.sidebar.caption("🚀 Fast startup • Cloud optimized")
-                            return llm
-                        except Exception as model_error:
-                            st.sidebar.warning(f"⚠️ {model_name} failed, trying next...")
-                            continue
-                            
-                except Exception as hf_error:
-                    st.sidebar.error(f"❌ HuggingFace error: {str(hf_error)}")
-            else:
-                # Try free HuggingFace Inference API without auth (limited requests)
-                try:
-                    st.sidebar.info("🔄 Trying free inference API...")
-                    from langchain_community.llms import HuggingFaceEndpoint
-                    
-                    # Use small model for free tier
-                    llm = HuggingFaceEndpoint(
-                        repo_id="google/flan-t5-small",
-                        temperature=0.3,
-                        max_length=150
-                    )
-                    
-                    response = llm.invoke("Hi")
-                    if response:
-                        st.sidebar.success("✅ Using Free Inference API")
-                        st.sidebar.caption("⚡ Limited requests • Add API key for unlimited")
-                        return llm
-                except Exception as free_error:
-                    st.sidebar.warning(f"⚠️ Free API failed: {str(free_error)}")
-                    st.sidebar.info("💡 Add HUGGINGFACE_API_KEY for reliable access")
-        
-        # LOCAL: Try Ollama for local development
-        if is_local_dev and not is_cloud_deployment:
-            try:
-                from langchain_community.llms import Ollama
-                llm = Ollama(model="mistral", temperature=0.7)
-                response = llm.invoke("Hi")
-                if response:
-                    st.sidebar.success("✅ Using Ollama/Mistral (FREE)")
-                    return llm
-            except Exception as ollama_error:
-                st.sidebar.warning(f"⚠️ Ollama not available: {str(ollama_error)}")
-                # Try alternative local model
-                try:
-                    from transformers import pipeline
-                    from langchain_community.llms import HuggingFacePipeline
-                    
-                    pipe = pipeline("text-generation", model="microsoft/DialoGPT-medium", 
-                                  tokenizer="microsoft/DialoGPT-medium",
-                                  max_length=200,
-                                  temperature=0.7)
-                    llm = HuggingFacePipeline(pipeline=pipe)
-                    response = llm.invoke("Hi")
-                    if response:
-                        st.sidebar.success("✅ Using DialoGPT (FREE)")
-                        return llm
-                except Exception as fallback_error:
-                    st.sidebar.error(f"❌ Fallback model failed: {str(fallback_error)}")
-        else:
-            st.sidebar.warning("🌐 Cloud deployment detected")
-            st.sidebar.info("💡 Add HUGGINGFACE_API_KEY for FREE cloud LLM")
-        
-        # Try OpenAI as fallback (if user wants to pay)
-        if OPENAI_API_KEY:
-            try:
-                from langchain_community.llms import OpenAI
-                llm = OpenAI(openai_api_key=OPENAI_API_KEY, temperature=0.7)
-                # Test with a simple query
-                response = llm.invoke("Hi")
-                if response:
-                    st.sidebar.success("✅ Using OpenAI GPT")
-                    return llm
-            except Exception as openai_error:
-                st.sidebar.error(f"❌ OpenAI error: {str(openai_error)}")
-        
-        # Try Ollama for local development
-        if not is_cloud_deployment:
-            try:
-                # Get content type if documents are loaded
-                if hasattr(st.session_state, 'docs') and st.session_state.docs:
-                    content_type = detect_content_type(st.session_state.docs)
-                    model = OLLAMA_MODELS.get(content_type, DEFAULT_MODEL)
-                else:
-                    model = DEFAULT_MODEL
-                
-                # Let user override model choice
-                selected_model = st.sidebar.selectbox(
-                    "Select LLM Model",
-                    options=list(OLLAMA_MODELS.values()),
-                    index=list(OLLAMA_MODELS.values()).index(model),
-                    help="Choose the best model for your use case"
-                )
-                
-                # Test Ollama connection
-                try:
-                    # Initialize Ollama with simplified configuration
-                    from langchain_community.llms import Ollama
-                    llm = Ollama(
-                        model=selected_model,
-                        temperature=0.7,
-                        base_url="http://localhost:11434"
-                    )
-                    # Log the initialization details
-                    logger.info(f"Initialized Ollama with model: {selected_model}")
-                    # Simple test query with more informative error handling
-                    response = llm.invoke("Hi")
-                    logger.info(f"Ollama response: {response}")
-                    if response:
-                        st.sidebar.success(f"✅ Using Ollama with {selected_model}")
-                        return llm
-                    else:
-                        st.sidebar.error("❌ Ollama test response was empty")
-                        logger.error("Ollama test response was empty.")
-                except Exception as query_error:
-                    st.sidebar.error(f"❌ Ollama test query failed: {str(query_error)}")
-                    logger.error(f"Ollama test query failed: {str(query_error)}")
-                raise RuntimeError("Failed to initialize Ollama. Check logs for details.")
-            except Exception as e:
-                st.sidebar.warning("⚠️ Ollama not available locally")
-                logger.error(f"Ollama error: {str(e)}")
-        
-        # If everything fails
-        st.error("❌ No LLM available. Please add one of these FREE options:")
-        st.error("1. **🤗 Hugging Face** (FREE): Get API key from https://huggingface.co/settings/tokens")
-        st.error("2. **🤖 Local Ollama**: Install from https://ollama.ai")
-        st.error("3. **💳 OpenAI** (Paid): Set OPENAI_API_KEY")
-        st.info("💡 For portfolio demos, Hugging Face is completely FREE!")
-        return None
-        
-    except Exception as e:
-        st.error(f"Error initializing LLM: {str(e)}")
-        return None
-
-def query_rag(query: str, retriever: Any, chat_history: List[Dict]) -> str:
-    """Query the RAG pipeline or general chat."""
-    llm = get_llm()
-    if llm is None:
-        return "LLM not available. Please check the setup instructions.", ""
-        
-    try:
-        # If retriever is available, use RAG
-        if retriever:
-            # Convert chat history from dict format to tuple format expected by ConversationalRetrievalChain
-            formatted_history = []
-            for i in range(0, len(chat_history) - 1, 2):  # Process pairs of user/assistant messages
-                if i + 1 < len(chat_history):
-                    user_msg = chat_history[i]
-                    assistant_msg = chat_history[i + 1]
-                    if user_msg.get('role') == 'user' and assistant_msg.get('role') == 'assistant':
-                        formatted_history.append((user_msg['content'], assistant_msg['content']))
-            
-            chain = ConversationalRetrievalChain.from_llm(
-                llm,
-                retriever,
-                return_source_documents=True,
-                chain_type="stuff"
-            )
-            result = chain.invoke({"question": query, "chat_history": formatted_history})
-            answer = result["answer"]
-            sources = result.get("source_documents", [])
-            
-            citations = []
-            for src in sources:
-                meta = src.metadata
-                page = meta.get("page", "?")
-                fname = meta.get("source", "?")
-                citations.append(f"{fname} (page {page})")
-            citation_str = ", ".join(citations)
-            return answer, citation_str
-        else:
-            # General chat mode without documents
-            response = llm.invoke(query)
-            return response, ""
-            
-    except Exception as e:
-        st.error(f"Error during query: {str(e)}")
-        logger.error(f"Error during query: {str(e)}")
-        return "Error processing your question. Please try again.", ""
-
-def clear_qdrant():
-    """Clear the Qdrant collection."""
-    try:
-        # Check if collection exists before trying to delete
-        collections = qdrant_client.get_collections()
-        collection_exists = any(col.name == COLLECTION_NAME for col in collections.collections)
-        
-        if collection_exists:
-            qdrant_client.delete_collection(collection_name=COLLECTION_NAME)
-            st.success("Qdrant collection cleared successfully.")
-        else:
-            st.info("No collection to clear.")
-            
-        # Reset session state
-        st.session_state.indexed = False
-        st.session_state.docs = []
-        st.session_state.db = None
-        st.session_state.retriever = None
-        st.session_state.chain = None
-        st.session_state.chat_history = []
-        
-    except Exception as e:
-        st.error(f"Failed to clear Qdrant: {e}")
-        logger.error(f"Failed to clear Qdrant: {e}")
-        # If server connection fails, just reset session state
-        st.session_state.indexed = False
-        st.session_state.docs = []
-        st.session_state.db = None
-        st.session_state.retriever = None
-        st.session_state.chain = None
-        st.session_state.chat_history = []
-
-# Streamlit UI
 st.set_page_config(
     page_title="PDF Q&A Chatbot",
     page_icon="📚",
     layout="wide",
-    menu_items={
-        'About': "🤗 Optimized for HuggingFace Spaces deployment"
+    menu_items={"About": "Ask questions about uploaded PDF and text documents."},
+)
+
+
+@st.cache_resource
+def get_embeddings(model_name: str):
+    from langchain_huggingface import HuggingFaceEmbeddings
+
+    return HuggingFaceEmbeddings(
+        model_name=model_name,
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True},
+    )
+
+
+@st.cache_resource
+def get_qdrant_resources(
+    collection_name: str,
+    embedding_model: str,
+    qdrant_url: str,
+    qdrant_api_key: str,
+):
+    embeddings = get_embeddings(embedding_model)
+    if qdrant_url:
+        client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key or None)
+    else:
+        client = QdrantClient(":memory:")
+
+    if not client.collection_exists(collection_name):
+        vector_size = len(embeddings.embed_query("dimension check"))
+        client.create_collection(
+            collection_name=collection_name,
+            vectors_config=VectorParams(
+                size=vector_size,
+                distance=Distance.COSINE,
+            ),
+        )
+
+    vector_store = QdrantVectorStore(
+        client=client,
+        collection_name=collection_name,
+        embedding=embeddings,
+    )
+    return client, vector_store
+
+
+@st.cache_resource
+def load_flan_t5(model_name: str):
+    from langchain_huggingface import HuggingFacePipeline
+
+    return HuggingFacePipeline.from_model_id(
+        model_id=model_name,
+        task="text2text-generation",
+        pipeline_kwargs={
+            "max_new_tokens": 128,
+            "do_sample": False,
+            "truncation": True,
+        },
+    )
+
+
+@st.cache_resource
+def load_ollama(model_name: str, base_url: str):
+    from langchain_ollama import OllamaLLM
+
+    return OllamaLLM(
+        model=model_name,
+        base_url=base_url,
+        temperature=0.1,
+    )
+
+
+def get_llm():
+    if LLM_BACKEND == "flan_t5":
+        return load_flan_t5(FLAN_MODEL)
+    if LLM_BACKEND == "ollama":
+        return load_ollama(OLLAMA_MODEL, OLLAMA_BASE_URL)
+    raise ValueError("LLM_BACKEND must be either 'flan_t5' or 'ollama'.")
+
+
+def initialize_session_state() -> None:
+    defaults = {
+        "document_chunks": [],
+        "document_names": [],
+        "messages": [],
+        "session_id": uuid4().hex,
+        "index_id": None,
+        "uploader_key": 0,
     }
-)
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
-# Main title with environment indicator
-st.title("� PDF Q&A Chat")
-st.caption("Upload documents and chat with them using AI • Powered by RAG & HuggingFace")
 
-# Sidebar - Simplified
-st.sidebar.title("� Document Manager")
-
-# Connection status - simplified
-if QDRANT_CONNECTED:
-    if QDRANT_URL:
-        st.sidebar.success("✅ Qdrant Cloud Connected")
-        # Add a simple test button
-        if st.sidebar.button("🔧 Test Connection"):
-            try:
-                collections = qdrant_client.get_collections()
-                st.sidebar.info(f"📊 Found {len(collections.collections)} collections")
-            except Exception as e:
-                st.sidebar.error(f"❌ Connection test failed: {str(e)}")
-    else:
-        st.sidebar.success("✅ Local Qdrant")
-else:
-    st.sidebar.warning("⚠️ Memory Mode - Add QDRANT_URL & QDRANT_API_KEY to secrets")
-
-st.sidebar.markdown("---")
-
-uploaded_files = st.sidebar.file_uploader(
-    "📁 Upload Documents",
-    type=["pdf", "txt"],
-    accept_multiple_files=True,
-    help="Upload PDF or TXT files to chat with them"
-)
-
-# Show selected files
-if uploaded_files:
-    st.sidebar.write(f"📄 **{len(uploaded_files)} file(s) selected:**")
-    for file in uploaded_files:
-        st.sidebar.write(f"• {file.name}")
-
-# Process button
-if st.sidebar.button("🚀 Process Documents", type="primary", disabled=not uploaded_files):
-    if uploaded_files:
-        progress_bar = st.sidebar.progress(0)
-        status_text = st.sidebar.empty()
-        
-        try:
-            # Load documents with progress
-            status_text.text("📄 Loading documents...")
-            progress_bar.progress(0.2)
-            
-            # Check file types first
-            valid_files = []
-            for file in uploaded_files:
-                if file.name.split(".")[-1].lower() in ["pdf", "txt"]:
-                    valid_files.append(file)
-                else:
-                    st.sidebar.warning(f"⚠️ Skipping {file.name} (unsupported type)")
-            
-            if not valid_files:
-                st.sidebar.error("❌ No valid files (only PDF/TXT supported)")
-                progress_bar.empty()
-                status_text.empty()
+def render_messages(messages: Sequence[dict]) -> None:
+    for message in messages:
+        with st.chat_message(message["role"]):
+            if message.get("error"):
+                st.error(message["content"])
             else:
-                docs = load_documents(valid_files)
-                
-                if not docs:
-                    st.sidebar.error("❌ No readable content found in files")
-                    progress_bar.empty()
-                    status_text.empty()
-                else:
-                    # Process documents
-                    status_text.text("🔄 Processing documents...")
-                    progress_bar.progress(0.5)
-                    st.session_state.docs = docs
-                    
-                    chunks, embeddings = chunk_and_embed(docs)
-                    progress_bar.progress(0.7)
-                    
-                    if chunks and embeddings:
-                        # Index to database
-                        status_text.text("🗄️ Creating vector database...")
-                        st.session_state.db = index_to_qdrant(chunks, embeddings)
-                        if st.session_state.db:
-                            st.session_state.retriever = st.session_state.db.as_retriever()
-                            st.session_state.indexed = True
-                            
-                            progress_bar.progress(1.0)
-                            status_text.text("✅ Complete!")
-                            
-                            # Success message
-                            st.sidebar.success(f"🎉 Ready! Processed {len(valid_files)} files")
-                            st.sidebar.info(f"📊 Created {len(chunks)} searchable chunks")
-                            st.balloons()
-                        else:
-                            st.sidebar.error("❌ Failed to create vector database")
-                    else:
-                        st.sidebar.error("❌ Failed to process documents")
-                        
-        except Exception as e:
-            st.sidebar.error(f"❌ Error: {str(e)}")
-            st.sidebar.info("💡 Try uploading simpler PDF files or check the logs")
-        finally:
-            progress_bar.empty()
-            status_text.empty()
+                st.markdown(message["content"])
+            sources = message.get("sources", [])
+            if sources:
+                with st.expander(f"Source passages ({len(sources)})"):
+                    for source in sources[:20]:
+                        st.caption(source["label"])
+                        st.write(source["text"])
+                    if len(sources) > 20:
+                        st.caption(f"{len(sources) - 20} more passages omitted.")
 
-if st.sidebar.button("🗑️ Clear All", disabled=not st.session_state.indexed):
-    clear_qdrant()
-    st.sidebar.success("✅ Cleared!")
-    st.rerun()
 
-# Add cache clearing button
-if st.sidebar.button("🔄 Clear Cache"):
-    clear_streamlit_cache()
-    st.rerun()
-
-st.sidebar.markdown("---")
-
-# Status - simplified
-if st.session_state.indexed:
-    st.sidebar.success(f"✅ **{len(st.session_state.docs)}** docs indexed")
-    st.sidebar.info(f"💬 **{len(st.session_state.chat_history)}** messages")
-else:
-    st.sidebar.info("📤 Ready for documents")
-
-# Model info - minimal
-st.sidebar.markdown("---")
-st.sidebar.markdown("**🤖 AI Model**")
-st.sidebar.caption("Google FLAN-T5 (Free)")
-st.sidebar.caption("Qdrant Vector DB")
-
-# Main Content Area - Always available chat
-st.markdown("### 💬 AI Assistant")
-
-# Show current mode
-if st.session_state.indexed:
-    st.info(f"📚 **Document Mode**: Chatting with {len(st.session_state.docs)} uploaded documents")
-else:
-    st.info("🤖 **General Mode**: Ask me anything! Upload documents for document-specific Q&A")
-
-# New chat button - top right
-col1, col2 = st.columns([4, 1])
-with col2:
-    if st.button("🔄 New Chat", type="secondary"):
-        st.session_state.chat_history = []
-        st.rerun()
-
-# Display chat history - always show
-for msg in st.session_state.chat_history:
-    if msg["role"] == "user":
-        with st.chat_message("user"):
-            st.write(msg["content"])
-    else:
-        with st.chat_message("assistant"):
-            content = msg["content"]
-            if "📎 **Sources:**" in content:
-                answer_part, sources_part = content.split("📎 **Sources:**", 1)
-                st.write(answer_part)
-                st.caption(f"📎 Sources: {sources_part.strip()}")
-            else:
-                st.write(content)
-    
-# Quick questions - adaptive based on mode
-if not st.session_state.chat_history:
-    if st.session_state.indexed:
-        st.markdown("**Document questions:**")
-        quick_questions = [
-            "Summarize main points",
-            "Key requirements?", 
-            "Important dates?",
-            "Main topics?"
-        ]
-    else:
-        st.markdown("**General questions:**")
-        quick_questions = [
-            "What is artificial intelligence?",
-            "Explain machine learning", 
-            "How does RAG work?",
-            "What is Python?"
-        ]
-    
-    cols = st.columns(4)
-    for i, (col, question) in enumerate(zip(cols, quick_questions)):
-        with col:
-            if st.button(question, key=f"quick_{i}", use_container_width=True):
-                # Process question
-                st.session_state.chat_history.append({"role": "user", "content": question})
-                with st.spinner("Thinking..."):
-                    if st.session_state.indexed:
-                        # Document-specific Q&A using RAG
-                        answer, citations = query_rag(
-                            question,
-                            st.session_state.retriever,
-                            st.session_state.chat_history
-                        )
-                        response_text = answer
-                        if citations:
-                            response_text += f"\n\n📎 **Sources:** {citations}"
-                    else:
-                        # General Q&A using LLM only
-                        llm = get_llm()
-                        if llm:
-                            try:
-                                answer = llm.invoke(question)
-                                response_text = answer
-                            except Exception as e:
-                                response_text = f"Sorry, I encountered an error: {str(e)}"
-                        else:
-                            response_text = "AI model not available. Please check your setup."
-                    
-                    st.session_state.chat_history.append({"role": "assistant", "content": response_text})
-                st.rerun()
-
-# Chat input - adaptive placeholder
-if st.session_state.indexed:
-    placeholder_text = "Ask about your documents..."
-else:
-    placeholder_text = "Ask me anything..."
-
-user_input = st.chat_input(placeholder_text)
-
-if user_input:
-    # Add user message
-    st.session_state.chat_history.append({"role": "user", "content": user_input})
-    
-    # Get AI response
-    with st.spinner("Generating response..."):
-        if st.session_state.indexed:
-            # Document-specific Q&A using RAG
-            answer, citations = query_rag(
-                user_input,
-                st.session_state.retriever,
-                st.session_state.chat_history
+def run_chat_action(prompt: str, summarize: bool = False) -> None:
+    try:
+        llm = get_llm()
+        if summarize:
+            answer, source_chunks = summarize_document(
+                st.session_state.document_chunks,
+                llm,
             )
-            
-            response_text = answer
-            if citations:
-                response_text += f"\n\n📎 **Sources:** {citations}"
         else:
-            # General Q&A using LLM only
-            llm = get_llm()
-            if llm:
-                try:
-                    answer = llm.invoke(user_input)
-                    response_text = answer
-                except Exception as e:
-                    response_text = f"Sorry, I encountered an error: {str(e)}"
-            else:
-                response_text = "AI model not available. Please check your setup."
-        
-        st.session_state.chat_history.append({"role": "assistant", "content": response_text})
-        st.rerun()
+            _, vector_store = get_qdrant_resources(
+                COLLECTION_NAME,
+                EMBEDDING_MODEL,
+                QDRANT_URL or "",
+                QDRANT_API_KEY or "",
+            )
+            retriever = create_session_retriever(
+                vector_store,
+                st.session_state.session_id,
+                st.session_state.index_id,
+            )
+            answer, source_chunks = answer_question(
+                prompt,
+                retriever,
+                llm,
+                st.session_state.messages,
+            )
+        sources = [
+            {"label": source_label(chunk), "text": source_text(chunk)}
+            for chunk in source_chunks
+        ]
+        st.session_state.messages.extend(
+            [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": answer, "sources": sources},
+            ]
+        )
+    except Exception as exc:
+        logger.exception("Document question failed")
+        st.session_state.messages.extend(
+            [
+                {"role": "user", "content": prompt},
+                {
+                    "role": "assistant",
+                    "content": (
+                        f"Could not complete the request: {exc}. Check the selected "
+                        "model configuration and service logs."
+                    ),
+                    "error": True,
+                },
+            ]
+        )
+    st.rerun()
 
-# Tips section - always visible
-st.markdown("---")
-st.markdown("### 💡 How to Use")
 
-if st.session_state.indexed:
-    st.markdown("""
-    **📄 Document Mode Active:**
-    • Ask specific questions about your uploaded documents
-    • Questions will search through your document content
-    • Check source citations to verify information
-    """)
+initialize_session_state()
+
+st.title("📚 PDF Q&A Chat")
+st.caption("Upload documents, get a document-wide summary, and ask questions with citations.")
+st.info(
+    "Text-based PDFs and TXT files only. Documents are session-scoped. "
+    "The first model use may take longer while models are downloaded."
+)
+
+with st.sidebar:
+    st.header("Documents")
+    if LLM_BACKEND == "flan_t5":
+        st.success(f"Hugging Face Space model: {FLAN_MODEL}")
+        st.caption("FLAN-T5 runs inside this Space on CPU; first load can be slow.")
+    elif LLM_BACKEND == "ollama":
+        st.success(f"Local Ollama model: {OLLAMA_MODEL}")
+        st.caption(f"Ollama endpoint: {OLLAMA_BASE_URL}")
+    else:
+        st.error("Unsupported LLM_BACKEND configuration.")
+
+    if QDRANT_URL:
+        st.caption("Vector store: configured Qdrant server")
+        st.warning(
+            "Source text is stored in the configured Qdrant server until the session "
+            "is cleared. Avoid sensitive documents."
+        )
+    else:
+        st.caption("Vector store: session-isolated in-memory Qdrant")
+
+    uploaded_files = st.file_uploader(
+        "Upload PDF or TXT files",
+        type=["pdf", "txt"],
+        accept_multiple_files=True,
+        key=f"document_uploader_{st.session_state.uploader_key}",
+        help="Text-based PDFs are supported. Scanned PDFs require OCR.",
+    )
+
+    if st.button("Process documents", type="primary", disabled=not uploaded_files):
+        total_size = sum(file.size for file in uploaded_files or [])
+        if total_size > MAX_TOTAL_UPLOAD_BYTES:
+            st.error("The combined upload size cannot exceed 25 MB.")
+        else:
+            pages = []
+            document_names = []
+            errors = []
+            with st.spinner("Extracting text and creating searchable chunks..."):
+                for uploaded_file in uploaded_files or []:
+                    try:
+                        pages.extend(
+                            load_document_pages(
+                                uploaded_file.name,
+                                uploaded_file.getvalue(),
+                            )
+                        )
+                        document_names.append(uploaded_file.name)
+                    except ValueError as exc:
+                        errors.append(f"{uploaded_file.name}: {exc}")
+
+            for error in errors:
+                st.error(error)
+
+            if pages:
+                chunks = chunk_pages(pages)
+                if len(chunks) > MAX_CHUNKS_PER_SESSION:
+                    st.error(
+                        f"Documents create {len(chunks)} chunks; the session limit "
+                        f"is {MAX_CHUNKS_PER_SESSION}. Upload fewer or shorter documents."
+                    )
+                else:
+                    try:
+                        with st.spinner("Loading embeddings and saving to Qdrant..."):
+                            client, vector_store = get_qdrant_resources(
+                                COLLECTION_NAME,
+                                EMBEDDING_MODEL,
+                                QDRANT_URL or "",
+                                QDRANT_API_KEY or "",
+                            )
+                            new_index_id = uuid4().hex
+                            documents = create_session_documents(
+                                chunks,
+                                st.session_state.session_id,
+                                new_index_id,
+                            )
+                            vector_store.add_documents(documents)
+
+                        old_index_id = st.session_state.index_id
+                        st.session_state.document_chunks = chunks
+                        st.session_state.document_names = document_names
+                        st.session_state.index_id = new_index_id
+                        st.session_state.messages = []
+                        if old_index_id:
+                            try:
+                                delete_session_documents(
+                                    client,
+                                    COLLECTION_NAME,
+                                    st.session_state.session_id,
+                                    old_index_id,
+                                )
+                            except Exception:
+                                logger.exception("Could not remove the previous session index")
+                                st.warning(
+                                    "New documents are ready, but cleanup of the prior "
+                                    "session index failed. Use Clear session to remove it."
+                                )
+                        st.success(
+                            f"Ready: {len(document_names)} document(s), "
+                            f"{len(chunks)} searchable chunks."
+                        )
+                    except Exception as exc:
+                        logger.exception("Document indexing failed")
+                        st.error(f"Could not index documents in Qdrant: {exc}")
+            elif not errors:
+                st.error("No readable document content was found.")
+
+    if st.session_state.document_chunks:
+        st.success(
+            f"{len(st.session_state.document_names)} document(s) active in this session"
+        )
+        if st.button("Clear session"):
+            try:
+                client, _ = get_qdrant_resources(
+                    COLLECTION_NAME,
+                    EMBEDDING_MODEL,
+                    QDRANT_URL or "",
+                    QDRANT_API_KEY or "",
+                )
+                delete_session_documents(
+                    client,
+                    COLLECTION_NAME,
+                    st.session_state.session_id,
+                )
+                st.session_state.document_chunks = []
+                st.session_state.document_names = []
+                st.session_state.messages = []
+                st.session_state.index_id = None
+                st.session_state.uploader_key += 1
+                st.rerun()
+            except Exception as exc:
+                logger.exception("Could not clear the session index")
+                st.error(f"Could not clear this session's Qdrant data: {exc}")
+        st.caption("Clearing removes only this session's vectors.")
+
+st.markdown("### Document chat")
+if not st.session_state.document_chunks:
+    st.info("Upload and process documents to start.")
 else:
-    st.markdown("""
-    **🤖 General AI Mode:**
-    • Ask me about any topic - technology, science, etc.
-    • Upload documents above to switch to document-specific Q&A
-    • I can explain concepts, provide definitions, and answer questions
-    """)
+    if st.button("Summarize all uploaded documents"):
+        with st.spinner("Summarizing all document chunks..."):
+            run_chat_action("Summarize all uploaded documents.", summarize=True)
 
-# Footer
-st.markdown("---")
-st.caption("Made with ❤️ using Streamlit, LangChain & HuggingFace")
+    render_messages(st.session_state.messages)
+    prompt = st.chat_input("Ask a question about your documents")
+    if prompt:
+        with st.spinner("Retrieving passages and generating an answer..."):
+            run_chat_action(prompt)
